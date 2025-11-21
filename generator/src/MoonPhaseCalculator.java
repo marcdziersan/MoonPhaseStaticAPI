@@ -22,11 +22,18 @@ import java.util.List;
  * nach Zeitpunkten, bei denen der Phasenwert nahe genug an diesem Ziel
  * liegt (innerhalb einer Toleranz).
  *
- * Dieses Modell ist bewusst vereinfacht und wurde über eine separate
- * Kalibrierung (MoonPhaseCalibrationTool) gegen Referenzdaten von
- * 1900–2080 justiert.
+ * Das Modell ist bewusst vereinfacht und wurde mit dem
+ * MoonPhaseCalibrationTool gegen Referenzdaten 1900–2080 kalibriert.
+ * Zielgenauigkeit: auf den Kalendertag genau.
  */
 public class MoonPhaseCalculator {
+
+    /**
+     * Zeitschritt für die grobe Suche in calculateYear().
+     * 3 Stunden ist ein guter Kompromiss aus Genauigkeit und Laufzeit.
+     * (Bei Bedarf auf 1 reduzieren für noch feinere Ergebnisse.)
+     */
+    private static final int STEP_HOURS = 3;
 
     /**
      * Aufzählung der vier Hauptphasen.
@@ -96,16 +103,14 @@ public class MoonPhaseCalculator {
     }
 
     /**
-     * Erzeugt den "kalibrierten" Standard-Rechner auf Basis der
-     * zuvor durchgeführten Kalibrierung mit Referenzdaten 1900–2080.
+     * Erzeugt den kalibrierten Standard-Rechner auf Basis der
+     * vorherigen Kalibrierung mit Referenzdaten 1900–2080.
      *
-     * Die Kalibrierung ergab:
+     * Kalibrierte Werte (aus MoonPhaseCalibrationTool):
      *   referenceNewMoon   : 2000-01-06T18:14
      *   synodicMonthDays   : ~29.5306
      *   avgAbsError (Tage) : ~0.0033
      *   maxAbsError (Tage) : ~1.0
-     *
-     * Die Präzision reicht für "auf den Tag genau" (Kalenderzwecke).
      */
     public static MoonPhaseCalculator createDefault() {
         // Kalibrierter Referenz-Neumond
@@ -120,42 +125,52 @@ public class MoonPhaseCalculator {
     /**
      * Berechnet alle vier Hauptphasen für ein Jahr.
      *
+     * Es wird mit einem groben Raster von STEP_HOURS Stunden durch das Jahr
+     * (inkl. Puffer von ±2 Tagen) gegangen. Treffer im Toleranzbereich werden
+     * mit stündlicher Feinsuche verfeinert und anschließend „dedupliziert“.
+     *
      * @param year Jahr, z. B. 2025
      * @return Liste von Mondereignissen (sortiert nach Datum)
      */
     public List<MoonEvent> calculateYear(int year) {
         List<MoonEvent> result = new ArrayList<>();
 
-        // Wir suchen im Zeitraum [year-01-01, year-12-31 23:59]
-        LocalDateTime start = LocalDateTime.of(year, 1, 1, 0, 0);
-        LocalDateTime end = LocalDateTime.of(year, 12, 31, 23, 59);
+        // Zeitraum des Zieljahres
+        LocalDateTime yearStart = LocalDateTime.of(year, 1, 1, 0, 0);
+        LocalDateTime yearEnd   = LocalDateTime.of(year + 1, 1, 1, 0, 0);
 
-        // Start mit einem groben Raster (z. B. alle 6 Stunden)
-        long stepHours = 6; // Schrittweite für erste Suche
+        // Kleiner Puffer links/rechts: so erwischen wir Phasen, die knapp
+        // vor/nach der Jahresgrenze liegen, aber kalendarisch noch ins Jahr fallen.
+        LocalDateTime t    = yearStart.minusDays(2)
+                                      .withHour(0).withMinute(0).withSecond(0).withNano(0);
+        LocalDateTime tEnd = yearEnd.plusDays(2);
 
-        for (LocalDateTime dt = start; !dt.isAfter(end); dt = dt.plusHours(stepHours)) {
+        while (!t.isAfter(tEnd)) {
             // Für jede Hauptphase prüfen
-            checkAndAdd(result, dt, Phase.NEW_MOON, Phase.NEW_MOON.getTarget(), tolerancePhase);
-            checkAndAdd(result, dt, Phase.FIRST_QUARTER, Phase.FIRST_QUARTER.getTarget(), tolerancePhase);
-            checkAndAdd(result, dt, Phase.FULL_MOON, Phase.FULL_MOON.getTarget(), tolerancePhase);
-            checkAndAdd(result, dt, Phase.LAST_QUARTER, Phase.LAST_QUARTER.getTarget(), tolerancePhase);
+            checkAndAdd(result, t, Phase.NEW_MOON,       Phase.NEW_MOON.getTarget(),       tolerancePhase);
+            checkAndAdd(result, t, Phase.FIRST_QUARTER,  Phase.FIRST_QUARTER.getTarget(),  tolerancePhase);
+            checkAndAdd(result, t, Phase.FULL_MOON,      Phase.FULL_MOON.getTarget(),      tolerancePhase);
+            checkAndAdd(result, t, Phase.LAST_QUARTER,   Phase.LAST_QUARTER.getTarget(),   tolerancePhase);
+
+            // Grober Schritt
+            t = t.plusHours(STEP_HOURS);
         }
 
-        // Grobe Duplikate und Ausreißer bereinigen:
-        // - Sortieren
-        // - Einträge zusammenfassen, die zeitlich sehr dicht beieinander liegen
+        // Ergebnisse sortieren und zeitlich sehr nahe Treffer derselben Phase zusammenfassen
         result.sort((a, b) -> a.getDateTime().compareTo(b.getDateTime()));
         List<MoonEvent> cleaned = new ArrayList<>();
+
         for (MoonEvent ev : result) {
             if (cleaned.isEmpty()) {
                 cleaned.add(ev);
             } else {
                 MoonEvent last = cleaned.get(cleaned.size() - 1);
                 long diffHours = ChronoUnit.HOURS.between(last.getDateTime(), ev.getDateTime());
+
                 if (ev.getPhase() == last.getPhase() && Math.abs(diffHours) < 6) {
-                    // Wenn sehr nah beieinander, den "mittleren" Zeitpunkt wählen
-                    LocalDateTime mid = last.getDateTime()
-                            .plusSeconds(ChronoUnit.SECONDS.between(last.getDateTime(), ev.getDateTime()) / 2);
+                    // Sehr nah beieinander: wir wählen den Mittelwert der Zeitpunkte
+                    long diffSeconds = ChronoUnit.SECONDS.between(last.getDateTime(), ev.getDateTime());
+                    LocalDateTime mid = last.getDateTime().plusSeconds(diffSeconds / 2);
                     cleaned.set(cleaned.size() - 1, new MoonEvent(mid, ev.getPhase()));
                 } else {
                     cleaned.add(ev);
@@ -168,7 +183,8 @@ public class MoonPhaseCalculator {
 
     /**
      * Prüft an einem groben Rasterzeitpunkt dt, ob die Mondphase in der Nähe
-     * der gewünschten Phase liegt, und falls ja, verfeinert sie die Suche.
+     * der gewünschten Phase liegt. Falls ja, wird in einem kleineren Umfeld
+     * mit stündlichen Schritten nach dem Minimum der Phasenabweichung gesucht.
      */
     private void checkAndAdd(List<MoonEvent> result,
                              LocalDateTime dt,
@@ -178,9 +194,11 @@ public class MoonPhaseCalculator {
 
         double phaseValue = phaseValue(dt);
         double diff = phaseDistance(phaseValue, targetPhase);
+
         if (diff <= tol) {
             // Feinsuche in einem kleineren Zeitfenster, z. B. +/- 1 Tag um dt
-            LocalDateTime best = refinePhaseTime(dt.minusDays(1), dt.plusDays(1), phase, targetPhase);
+            LocalDateTime best = refinePhaseTime(dt.minusDays(1), dt.plusDays(1), targetPhase);
+
             if (best != null) {
                 result.add(new MoonEvent(best, phase));
             }
@@ -188,22 +206,26 @@ public class MoonPhaseCalculator {
     }
 
     /**
-     * Verfeinert die Suche innerhalb eines Zeitfensters, indem es mit kleinerer
-     * Schrittweite läuft und das Minimum der Phasenabweichung sucht.
+     * Verfeinert die Suche innerhalb eines Zeitfensters, indem mit
+     * 1-Stunden-Schritten das Minimum der Phasenabweichung gesucht wird.
+     *
+     * @param from        Start des Zeitfensters
+     * @param to          Ende des Zeitfensters
+     * @param targetPhase Zielphasenwert (0.0, 0.25, 0.5, 0.75)
+     * @return bester gefundener Zeitpunkt oder null, wenn kein Treffer im
+     *         Toleranzbereich gefunden wurde
      */
     private LocalDateTime refinePhaseTime(LocalDateTime from,
                                           LocalDateTime to,
-                                          Phase phase,
                                           double targetPhase) {
 
         LocalDateTime bestTime = null;
         double bestDiff = Double.MAX_VALUE;
 
-        // Hier z. B. 1-Stunden-Schritte. Man könnte weiter verfeinern,
-        // aber für "tagesgenau" reicht das aus.
         for (LocalDateTime t = from; !t.isAfter(to); t = t.plusHours(1)) {
             double p = phaseValue(t);
             double d = phaseDistance(p, targetPhase);
+
             if (d < bestDiff) {
                 bestDiff = d;
                 bestTime = t;
@@ -218,11 +240,15 @@ public class MoonPhaseCalculator {
 
     /**
      * Berechnet den Phasenwert im Bereich [0..1) für den Zeitpunkt t.
+     *
+     * 0   = Neumond, 0.5 = Vollmond, etc.
      */
     private double phaseValue(LocalDateTime t) {
-        double daysSinceRef = ChronoUnit.MINUTES.between(referenceNewMoon, t) / (60.0 * 24.0);
+        double minutes = ChronoUnit.MINUTES.between(referenceNewMoon, t);
+        double daysSinceRef = minutes / (60.0 * 24.0);
         double cycles = daysSinceRef / synodicMonthDays;
         double frac = cycles - Math.floor(cycles);
+
         if (frac < 0) {
             frac += 1.0;
         }
